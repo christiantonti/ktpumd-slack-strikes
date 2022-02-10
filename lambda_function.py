@@ -1,44 +1,54 @@
 import json
-import boto3
-from boto3.dynamodb.conditions import Key, Attr
-import botocore
 from urllib import parse
 import re
+from db_utils import Database
 
 def lambda_handler(event, context):
-    response = {}
+    # permissions for each role
     role_perms = {
-        'admin':('get', 'add', 'remove', 'register', 'help'),
-        'membership':('get', 'add', 'remove', 'help'),
-        'brother':('get', 'help'),
+        'admin':('get', 'all', 'add', 'remove', 'register', 'help'),
+        'membership':('get', 'all', 'add', 'remove', 'help'),
+        'brother':('get', 'all', 'help'),
         'pledge':('get', 'help'),
     }
+    # currently supported commands
     valid_cmds = ('get', 'add', 'remove', 'register', 'help')
-    dynamodb = boto3.resource('dynamodb')
-    client = boto3.client('dynamodb')
-    table = dynamodb.Table('ktpStrikes')
+
+    # init dynamodb Table
+    db = Database('ktpStrikes')
+
+    # parse GET string into arguments
+    print(f'EVENT: {event}')
     args = parse_body(event.get('body'))
     print(f'ARGS: {args}')
-    role = get_role(args.get('user_id'), table)
+
+    # fetch requestor role
+    requestor = args.get('user_id')
+    role = db.get_role(requestor)
     print(f'ROLE: {role}')
+
+    # unquote URL string and get message data
     data = parse.unquote(args.get('text')).split('+')
     argc = len(data)
     # data = [x.lower() for x in data]
+
     cmd = data[0].lower()
+    # check for valid commands and role permissions
     if argc < 1 or cmd not in valid_cmds: return invalid_msg()
     if cmd not in role_perms.get(role): return create_msg("Insufficient permissions for role: {}.".format(role), False)
+    # begin command switch
+    print(f'DATA: {data}')
     if cmd == 'get':
         uid = get_uid(data)
         print(f'UID: {uid}')
         if uid:
             if uid == 'all':
-                strikes = get_all_strikes(table)
-                print(strikes)
+                strikes = db.get_all_strikes()
                 msg = ':x: Strikes for all users:\n'
                 for n, s in strikes:
                     msg += f'{n}: {s}\n'
                 return create_msg(msg)
-            strikes = get_strikes(uid, table)
+            strikes = db.get_strikes(uid)
             if strikes != None:
                 return create_msg('%s has %d strikes' % (data[1],strikes))
             else:
@@ -49,30 +59,22 @@ def lambda_handler(event, context):
         uid = get_uid(data)
         if uid:
             amt = 1 if argc < 3 else int(data[2])
-            return modify_strikes(uid, amt, table)
+            return modify_strikes(uid, amt, db)
         else:
             return create_msg("*Usage:* `/strikes add [user] (amount)`", False)
     elif cmd == "remove":
         uid = get_uid(data)
         if uid:
             amt = -1 if argc < 3 else -1*int(data[2])
-            return modify_strikes(uid, amt, table)
+            return modify_strikes(uid, amt, db)
         else:
             return create_msg("*Usage:* `/strikes remove [user] (amount)`", False)
     elif cmd == "register":
         uid = get_uid(data)
         if uid and argc == 4:
-            try:
-                table.put_item(
-                    Item={
-                        'user_id':uid,
-                        'strikes':0,
-                        'firstname':data[2],
-                        'lastname':data[3]
-                    })
+            if db.register_user(uid, data[2], data[3]):
                 return create_msg('Successfully registered %s' % data[1])
-            except botocore.exceptions.ClientError as error:
-                print('ERROR' + error)
+            else:
                 return create_msg("Error registering user")
         else:
             return create_msg("*Usage:* `/strikes register [user] [firstname] [lastname]`", False)
@@ -100,65 +102,17 @@ def get_uid(data):
             return uid
     return None
         
-def get_role(uid, table):
-    try:
-        r = table.get_item(
-            Key={
-                'user_id':uid
-            })
-        role = r['Item']['role']
-        return role
-    except:
-        return None
-        
-def get_strikes(uid, table):
-    try:
-        r = table.get_item(
-            Key={
-                'user_id':uid
-            })
-        print(r)
-        strikes = int(r['Item']['strikes'])
-        return strikes
-    except:
-        return None
-        
-def get_all_strikes(table):
-    print('called get all')
-    try:
-        r = table.scan(FilterExpression=Attr('strikes').exists())
-        retlist = []
-        for item in r['Items']:
-            retlist.append((f"{item['firstname']} {item['lastname']}", int(item['strikes'])))
-        return sorted(retlist, key=lambda i: i[1], reverse=True)
-    except:
-        return None
-        
-def modify_strikes(uid, amt, table):
-    strikes = get_strikes(uid, table)
+def modify_strikes(uid, amt, db):
+    strikes = db.get_strikes(uid)
     if strikes != None:
         strikes += amt
         if strikes < 0: return create_msg("Would result in negative strikes!", False)
-        if update_strikes(uid, strikes, table):
+        if db.update_strikes(uid, strikes):
             return create_msg('<@%s> now has %d strikes' % (uid, strikes))
         else:
             return create_msg("Error adding strikes")
     else:
         return create_msg("Error getting strikes")
-    
-def update_strikes(uid, strikes, table):
-    try:
-        table.update_item(
-            Key={
-                'user_id': uid,
-            },
-            UpdateExpression='SET strikes = :val1',
-            ExpressionAttributeValues={
-                ':val1': strikes
-            })
-        return True
-    except:
-        return False
         
 def invalid_msg():
     return create_msg("*Invalid Command!* To see available commands, type `/strikes help`", False)
